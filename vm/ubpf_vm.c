@@ -398,8 +398,18 @@ ubpf_exec(const struct ubpf_vm* vm, void* mem, size_t mem_len, uint64_t* bpf_ret
     reg[2] = (uint64_t)mem_len;
     reg[10] = (uintptr_t)stack + UBPF_STACK_SIZE;
 
+    int instruction_limit = vm->instruction_limit;
+
     while (1) {
         const uint16_t cur_pc = pc;
+        if (pc >= vm->num_insts) {
+            return_value = -1;
+            goto cleanup;
+        }
+        if (vm->instruction_limit && instruction_limit-- <= 0) {
+            return_value = -1;
+            goto cleanup;
+        }
         struct ebpf_inst inst = ubpf_fetch_instruction(vm, pc++);
 
         switch (inst.opcode) {
@@ -1188,31 +1198,65 @@ bounds_check(
 {
     if (!vm->bounds_check_enabled)
         return true;
-    if (mem && (addr >= mem && ((char*)addr + size) <= ((char*)mem + mem_len))) {
-        /* Context access */
-        return true;
-    } else if (addr >= stack && ((char*)addr + size) <= ((char*)stack + UBPF_STACK_SIZE)) {
-        /* Stack access */
-        return true;
-    } else if (
-        vm->bounds_check_function != NULL &&
-        vm->bounds_check_function(vm->bounds_check_user_data, (uintptr_t)addr, size)) {
-        /* Registered region */
-        return true;
-    } else {
+
+    uintptr_t access_start= (uintptr_t)addr;
+    uintptr_t access_end = access_start + size;
+    uintptr_t stack_start = (uintptr_t)stack;
+    uintptr_t stack_end = stack_start + UBPF_STACK_SIZE;
+    uintptr_t mem_start = (uintptr_t)mem;
+    uintptr_t mem_end = mem_start + mem_len;
+
+    // Memory in the range [access_start, access_end) is being accessed.
+    // Memory in the range [stack_start, stack_end) is the stack.
+    // Memory in the range [mem_start, mem_end) is the memory.
+
+    if (access_start > access_end) {
         vm->error_printf(
             stderr,
-            "uBPF error: out of bounds memory %s at PC %u, addr %p, size %d\nmem %p/%zd stack %p/%d\n",
+            "uBPF error: invalid memory access %s at PC %u, addr %p, size %d\n",
             type,
             cur_pc,
             addr,
-            size,
-            mem,
-            mem_len,
-            stack,
-            UBPF_STACK_SIZE);
+            size);
         return false;
     }
+
+    // Check if the access is within the memory bounds.
+    // Note: The comparison is <= because the end address is one past the last byte for both
+    // the access and the memory regions.
+    if (access_start >= mem_start && access_end <= mem_end) {
+        return true;
+    }
+
+    // Check if the access is within the stack bounds.
+    // Note: The comparison is <= because the end address is one past the last byte for both
+    // the access and the stack regions.
+    if (access_start >= stack_start && access_end <= stack_end) {
+        return true;
+    }
+
+    // The address may be invalid or it may be a region of memory that the caller
+    // is aware of but that is not part of the stack or memory.
+    // Call any registered bounds check function to determine if the access is valid.
+    if (vm->bounds_check_function != NULL && vm->bounds_check_function(vm->bounds_check_user_data, access_start, size)) {
+        return true;
+    }
+
+    // Memory is neither stack, nor memory, nor valid according to the bounds check function.
+
+    // Access is out of bounds.
+    vm->error_printf(
+        stderr,
+        "uBPF error: out of bounds memory %s at PC %u, addr %p, size %d\nmem %p/%zd stack %p/%d\n",
+        type,
+        cur_pc,
+        addr,
+        size,
+        mem,
+        mem_len,
+        stack,
+        UBPF_STACK_SIZE);
+    return false;
 }
 
 char*
@@ -1321,5 +1365,15 @@ ubpf_register_data_bounds_check(struct ubpf_vm* vm, void* user_context, ubpf_bou
     }
     vm->bounds_check_function = bounds_check;
     vm->bounds_check_user_data = user_context;
+    return 0;
+}
+
+int
+ubpf_set_instruction_limit(struct ubpf_vm* vm, uint32_t limit, uint32_t* previous_limit)
+{
+    if (previous_limit != NULL) {
+        *previous_limit = vm->instruction_limit;
+    }
+    vm->instruction_limit = limit;
     return 0;
 }
