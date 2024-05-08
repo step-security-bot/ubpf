@@ -30,9 +30,9 @@
 #include "ubpf_int.h"
 #include <unistd.h>
 
-#define MAX_EXT_FUNCS 64
 #define SHIFT_MASK_32_BIT(X) ((X) & 0x1f)
 #define SHIFT_MASK_64_BIT(X) ((X) & 0x3f)
+#define DEFAULT_JITTER_BUFFER_SIZE 65536
 
 static bool
 validate(const struct ubpf_vm* vm, const struct ebpf_inst* insts, uint32_t num_insts, char** errmsg);
@@ -64,6 +64,12 @@ ubpf_set_error_print(struct ubpf_vm* vm, int (*error_printf)(FILE* stream, const
         vm->error_printf = fprintf;
 }
 
+static uint64_t
+ubpf_default_external_dispatcher(uint64_t arg1, uint64_t arg2, uint64_t arg3, uint64_t arg4, uint64_t arg5, unsigned int index, external_function_t *external_fns)
+{
+    return external_fns[index](arg1, arg2, arg3, arg4, arg5);
+}
+
 struct ubpf_vm*
 ubpf_create(void)
 {
@@ -88,13 +94,20 @@ ubpf_create(void)
     vm->error_printf = fprintf;
 
 #if defined(__x86_64__) || defined(_M_X64)
-    vm->translate = ubpf_translate_x86_64;
+    vm->jit_translate = ubpf_translate_x86_64;
+    vm->jit_update_dispatcher = ubpf_jit_update_dispatcher_x86_64;
+    vm->jit_update_helper = ubpf_jit_update_helper_x86_64;
 #elif defined(__aarch64__) || defined(_M_ARM64)
-    vm->translate = ubpf_translate_arm64;
+    vm->jit_translate = ubpf_translate_arm64;
+    vm->jit_update_dispatcher = ubpf_jit_update_dispatcher_arm64;
+    vm->jit_update_helper = ubpf_jit_update_helper_arm64;
 #else
     vm->translate = ubpf_translate_null;
 #endif
     vm->unwind_stack_extension_index = -1;
+
+    vm->jitted_result.compile_result = UBPF_JIT_COMPILE_FAILURE;
+    vm->jitter_buffer_size = DEFAULT_JITTER_BUFFER_SIZE;
     return vm;
 }
 
@@ -114,13 +127,10 @@ as_external_function_t(void* f)
     return (external_function_t)f;
 };
 
+
 int
 ubpf_register(struct ubpf_vm* vm, unsigned int idx, const char* name, external_function_t fn)
 {
-    if (vm->dispatcher != NULL) {
-        return -1;
-    }
-
     if (idx >= MAX_EXT_FUNCS) {
         return -1;
     }
@@ -128,17 +138,51 @@ ubpf_register(struct ubpf_vm* vm, unsigned int idx, const char* name, external_f
     vm->ext_funcs[idx] = (ext_func)fn;
     vm->ext_func_names[idx] = name;
 
-    return 0;
+    int success = 0;
+
+    if (vm->jitted_result.compile_result == UBPF_JIT_COMPILE_SUCCESS) {
+        if (mprotect(vm->jitted, vm->jitted_size, PROT_READ | PROT_WRITE) < 0) {
+            return -1;
+        }
+
+        // Now, update!
+        if (!vm->jit_update_helper(vm, fn, idx, (uint8_t*)vm->jitted, vm->jitted_size, vm->jitted_result.external_helper_offset)) {
+            // Can't immediately stop here because we have unprotected memory!
+            success = -1;
+        }
+
+        if (mprotect(vm->jitted, vm->jitted_size, PROT_READ | PROT_EXEC) < 0) {
+            return -1;
+        }
+    }
+    return success;
 }
 
 int
 ubpf_register_external_dispatcher(
-    struct ubpf_vm* vm, external_function_dispatcher_t dispatcher, external_function_validate_t validater, void* cookie)
+    struct ubpf_vm* vm, external_function_dispatcher_t dispatcher, external_function_validate_t validater)
 {
     vm->dispatcher = dispatcher;
     vm->dispatcher_validate = validater;
-    vm->dispatcher_cookie = cookie;
-    return 0;
+
+    int success = 0;
+
+    if (vm->jitted_result.compile_result == UBPF_JIT_COMPILE_SUCCESS) {
+        if (mprotect(vm->jitted, vm->jitted_size, PROT_READ | PROT_WRITE) < 0) {
+            return -1;
+        }
+
+        // Now, update!
+        if (!vm->jit_update_dispatcher(vm, dispatcher, (uint8_t*)vm->jitted, vm->jitted_size, vm->jitted_result.external_dispatcher_offset)) {
+            // Can't immediately stop here because we have unprotected memory!
+            success = -1;
+        }
+
+        if (mprotect(vm->jitted, vm->jitted_size, PROT_READ | PROT_EXEC) < 0) {
+            return -1;
+        }
+    }
+    return success;
 }
 
 int
@@ -162,31 +206,6 @@ ubpf_lookup_registered_function(struct ubpf_vm* vm, const char* name)
             return i;
         }
     }
-    return -1;
-}
-
-bool
-ubpf_validate_external_helper(const struct ubpf_vm* vm, unsigned int idx)
-{
-    if (vm->dispatcher_validate) {
-        return vm->dispatcher_validate(idx, vm->dispatcher_cookie);
-    }
-
-    return vm->ext_funcs[idx] != NULL;
-}
-
-uint64_t
-ubpf_dispatch_to_external_helper(
-    uint64_t p0, uint64_t p1, uint64_t p2, uint64_t p3, uint64_t p4, const struct ubpf_vm* vm, unsigned int idx)
-{
-    if (vm->dispatcher != NULL) {
-        return vm->dispatcher(vm->dispatcher_cookie, idx, p0, p1, p2, p3, p4);
-    }
-
-    if (vm->ext_funcs[idx] != NULL) {
-        return vm->ext_funcs[idx](p0, p1, p2, p3, p4);
-    }
-
     return -1;
 }
 
@@ -335,6 +354,7 @@ ubpf_exec(const struct ubpf_vm* vm, void* mem, size_t mem_len, uint64_t* bpf_ret
     uint64_t _reg[16];
     uint64_t ras_index = 0;
     int return_value = -1;
+    void *external_dispatcher_cookie = mem;
 
 // Windows Kernel mode limits stack usage to 12K, so we need to allocate it dynamically.
 #if defined(NTDDI_VERSION) && defined(WINNT)
@@ -378,8 +398,18 @@ ubpf_exec(const struct ubpf_vm* vm, void* mem, size_t mem_len, uint64_t* bpf_ret
     reg[2] = (uint64_t)mem_len;
     reg[10] = (uintptr_t)stack + UBPF_STACK_SIZE;
 
+    int instruction_limit = vm->instruction_limit;
+
     while (1) {
         const uint16_t cur_pc = pc;
+        if (pc >= vm->num_insts) {
+            return_value = -1;
+            goto cleanup;
+        }
+        if (vm->instruction_limit && instruction_limit-- <= 0) {
+            return_value = -1;
+            goto cleanup;
+        }
         struct ebpf_inst inst = ubpf_fetch_instruction(vm, pc++);
 
         switch (inst.opcode) {
@@ -892,9 +922,11 @@ ubpf_exec(const struct ubpf_vm* vm, void* mem, size_t mem_len, uint64_t* bpf_ret
             // program was assembled with the same endianess as the host machine.
             if (inst.src == 0) {
                 // Handle call by address to external function.
-                // reg[0] = vm->ext_funcs[inst.imm](reg[1], reg[2], reg[3], reg[4], reg[5]);
-                reg[0] = ubpf_dispatch_to_external_helper(reg[1], reg[2], reg[3], reg[4], reg[5], vm, inst.imm);
-                // Unwind the stack if unwind extension returns success.
+                if (vm->dispatcher != NULL) {
+                    reg[0] = vm->dispatcher(reg[1], reg[2], reg[3], reg[4], reg[5], inst.imm, external_dispatcher_cookie);
+                } else {
+                    reg[0] = ubpf_default_external_dispatcher(reg[1], reg[2], reg[3], reg[4], reg[5], inst.imm, vm->ext_funcs);
+                }
                 if (inst.imm == vm->unwind_stack_extension_index && reg[0] == 0) {
                     *bpf_return_value = reg[0];
                     return_value = 0;
@@ -1104,14 +1136,14 @@ validate(const struct ubpf_vm* vm, const struct ebpf_inst* insts, uint32_t num_i
                     *errmsg = ubpf_error("invalid call immediate at PC %d", i);
                     return false;
                 }
-                if ((vm->dispatcher != NULL && !vm->dispatcher_validate(inst.imm, vm->dispatcher_cookie)) ||
+                if ((vm->dispatcher != NULL && !vm->dispatcher_validate(inst.imm, vm)) ||
                     (vm->dispatcher == NULL && !vm->ext_funcs[inst.imm])) {
                     *errmsg = ubpf_error("call to nonexistent function %u at PC %d", inst.imm, i);
                     return false;
                 }
             } else if (inst.src == 1) {
                 int call_target = i + (inst.imm + 1);
-                if (call_target < 0 || call_target > num_insts) {
+                if (call_target < 0 || call_target >= num_insts) {
                     *errmsg =
                         ubpf_error("call to local function (at PC %d) is out of bounds (target: %d)", i, call_target);
                     return false;
@@ -1166,31 +1198,65 @@ bounds_check(
 {
     if (!vm->bounds_check_enabled)
         return true;
-    if (mem && (addr >= mem && ((char*)addr + size) <= ((char*)mem + mem_len))) {
-        /* Context access */
-        return true;
-    } else if (addr >= stack && ((char*)addr + size) <= ((char*)stack + UBPF_STACK_SIZE)) {
-        /* Stack access */
-        return true;
-    } else if (
-        vm->bounds_check_function != NULL &&
-        vm->bounds_check_function(vm->bounds_check_user_data, (uintptr_t)addr, size)) {
-        /* Registered region */
-        return true;
-    } else {
+
+    uintptr_t access_start= (uintptr_t)addr;
+    uintptr_t access_end = access_start + size;
+    uintptr_t stack_start = (uintptr_t)stack;
+    uintptr_t stack_end = stack_start + UBPF_STACK_SIZE;
+    uintptr_t mem_start = (uintptr_t)mem;
+    uintptr_t mem_end = mem_start + mem_len;
+
+    // Memory in the range [access_start, access_end) is being accessed.
+    // Memory in the range [stack_start, stack_end) is the stack.
+    // Memory in the range [mem_start, mem_end) is the memory.
+
+    if (access_start > access_end) {
         vm->error_printf(
             stderr,
-            "uBPF error: out of bounds memory %s at PC %u, addr %p, size %d\nmem %p/%zd stack %p/%d\n",
+            "uBPF error: invalid memory access %s at PC %u, addr %p, size %d\n",
             type,
             cur_pc,
             addr,
-            size,
-            mem,
-            mem_len,
-            stack,
-            UBPF_STACK_SIZE);
+            size);
         return false;
     }
+
+    // Check if the access is within the memory bounds.
+    // Note: The comparison is <= because the end address is one past the last byte for both
+    // the access and the memory regions.
+    if (access_start >= mem_start && access_end <= mem_end) {
+        return true;
+    }
+
+    // Check if the access is within the stack bounds.
+    // Note: The comparison is <= because the end address is one past the last byte for both
+    // the access and the stack regions.
+    if (access_start >= stack_start && access_end <= stack_end) {
+        return true;
+    }
+
+    // The address may be invalid or it may be a region of memory that the caller
+    // is aware of but that is not part of the stack or memory.
+    // Call any registered bounds check function to determine if the access is valid.
+    if (vm->bounds_check_function != NULL && vm->bounds_check_function(vm->bounds_check_user_data, access_start, size)) {
+        return true;
+    }
+
+    // Memory is neither stack, nor memory, nor valid according to the bounds check function.
+
+    // Access is out of bounds.
+    vm->error_printf(
+        stderr,
+        "uBPF error: out of bounds memory %s at PC %u, addr %p, size %d\nmem %p/%zd stack %p/%d\n",
+        type,
+        cur_pc,
+        addr,
+        size,
+        mem,
+        mem_len,
+        stack,
+        UBPF_STACK_SIZE);
+    return false;
 }
 
 char*
@@ -1299,5 +1365,15 @@ ubpf_register_data_bounds_check(struct ubpf_vm* vm, void* user_context, ubpf_bou
     }
     vm->bounds_check_function = bounds_check;
     vm->bounds_check_user_data = user_context;
+    return 0;
+}
+
+int
+ubpf_set_instruction_limit(struct ubpf_vm* vm, uint32_t limit, uint32_t* previous_limit)
+{
+    if (previous_limit != NULL) {
+        *previous_limit = vm->instruction_limit;
+    }
+    vm->instruction_limit = limit;
     return 0;
 }
