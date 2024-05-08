@@ -13,6 +13,7 @@ name: Main
 permissions:
   contents: read
   security-events: write # Required by codeql task.
+  actions: read
 
 on:
   schedule:
