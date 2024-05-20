@@ -1,6 +1,6 @@
 var searchData=
 [
-  ['ubpf_5fbounds_5fcheck_42',['ubpf_bounds_check',['../ubpf_8h.html#a64bd2f640f675e3eeff48ea52583d699',1,'ubpf.h']]],
-  ['ubpf_5fdata_5frelocation_43',['ubpf_data_relocation',['../ubpf_8h.html#a70fb644d080e8448c1db17bb99858391',1,'ubpf.h']]],
-  ['ubpf_5fjit_5ffn_44',['ubpf_jit_fn',['../ubpf_8h.html#a6334115c4408267ec35087ade6128fa0',1,'ubpf.h']]]
+  ['external_5ffunction_5fdispatcher_5ft_69',['external_function_dispatcher_t',['../ubpf_8h.html#aa819644ac2adf81271cf703f9eb5614b',1,'ubpf.h']]],
+  ['external_5ffunction_5ft_70',['external_function_t',['../ubpf_8h.html#a97c06ae6f43ae6e0cbca64ac1e70bc30',1,'ubpf.h']]],
+  ['external_5ffunction_5fvalidate_5ft_71',['external_function_validate_t',['../ubpf_8h.html#a924a4a1a3e782846945d6adbabbcbb9c',1,'ubpf.h']]]
 ];
